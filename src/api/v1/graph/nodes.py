@@ -274,3 +274,23 @@ def rerank(state: GraphState) -> GraphState:
         "reranked_chunks": reranked,
         "retrieval_status": "ok" if reranked else "no_chunks",
     }
+
+
+# Check Relevance 
+def check_relevance(state: GraphState) -> str:
+    """
+    No threshold-based rejection anymore.
+    If any reranked chunks exist -> summarize.
+    If no chunks -> retry until max iterations, else no_answer.
+    """
+    chunks = state.get("reranked_chunks", []) or []
+    iteration = state["iteration"]
+    max_iter = state["max_iterations"]
+
+    if chunks:
+        return "summarize"
+
+    if iteration < max_iter:
+        return "rephrase"
+
+    return "no_answer"
