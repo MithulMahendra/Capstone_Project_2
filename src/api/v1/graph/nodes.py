@@ -448,3 +448,18 @@ def summarize_answer(state: GraphState) -> GraphState:
         "answer": final_answer,
         "policy_citations": ", ".join(seen),
     }
+
+def route_after_summary(state: GraphState) -> str:
+    print(
+        f"[route_after_summary] answer_found={state.get('answer_found')} "
+        f"iteration={state.get('iteration')} "
+        f"answer={state.get('answer')!r}"
+    )
+
+    if state.get("answer_found", False):
+        return "end"
+
+    if state["iteration"] < state["max_iterations"]:
+        return "rephrase"
+
+    return "no_answer"
