@@ -463,3 +463,203 @@ def route_after_summary(state: GraphState) -> str:
         return "rephrase"
 
     return "no_answer"
+
+# NL2SQL Node
+def nl2sql_node(state: GraphState) -> GraphState:
+    query = _current_query(state)
+    llm = get_llm()
+    db = get_sql_database()
+
+    schema_info = db.get_table_info()
+
+    _NL2SQL_SYSTEM = f"""\
+        You are a PostgreSQL expert that converts natural language into one safe SQL query.
+
+        Return ONLY raw SQL. No explanation. No markdown. No backticks.
+
+        Hard rules:
+        1. Generate exactly one read-only SQL query.
+        2. Allowed statements: SELECT or WITH ... SELECT only.
+        3. Never generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, MERGE, GRANT, or REVOKE.
+        4. Use only tables and columns that exist in the provided schema.
+        5. For non-aggregate queries, include LIMIT {_MAX_SQL_ROWS}.
+        6. If the user asks for counting, averaging, totals, grouping, or comparisons, use SQL aggregates correctly.
+        7. If text filtering is needed, use ILIKE where appropriate.
+        8. If the query is ambiguous, choose the most reasonable interpretation based only on the schema.
+        9. Do not invent columns or tables.
+        10. Do not output anything except SQL.
+
+        Database schema:
+        {{schema}}
+    """
+
+    sql_prompt = ChatPromptTemplate.from_messages([
+        ("system", _NL2SQL_SYSTEM),
+        ("human", "User question: {question}"),
+    ])
+
+    raw_sql_response = (sql_prompt | llm).invoke({
+        "schema": schema_info,
+        "question": query,
+    })
+
+    sql_query = _clean_sql(_safe_text(raw_sql_response.content))
+    print(f"[nl2sql] Generated SQL:\n{sql_query}")
+
+    if not _is_safe_select_query(sql_query):
+        print("[nl2sql] Unsafe or invalid SQL generated")
+        return {
+            **state,
+            "sql_query_executed": sql_query,
+            "sql_result": "SQL execution error: generated query was unsafe or invalid.",
+            "answer": "",
+            "database_name": _SQL_DB_NAME,
+            "sql_success": False,
+        }
+
+    try:
+        sql_result = db.run(sql_query)
+        sql_result = str(sql_result)
+    except Exception as exc:
+        sql_result = f"SQL execution error: {exc}"
+
+    print(f"[nl2sql] Result (truncated): {sql_result[:300]}")
+
+    has_data = _looks_like_has_data(sql_result)
+
+    answer = ""
+    if has_data:
+        _SQL_ANSWER_SYSTEM = """\
+            You are a concise data analyst.
+
+            Answer the user's question using ONLY the SQL result provided.
+
+            Rules:
+            1. Use only the SQL result.
+            2. Be concise and directly answer the question.
+            3. If the result is tabular, summarize clearly.
+            4. Do not mention assumptions unless necessary.
+            5. Do not mention SQL unless helpful.
+        """
+
+        answer_prompt = ChatPromptTemplate.from_messages([
+            ("system", _SQL_ANSWER_SYSTEM),
+            ("human", "User question:\n{query}\n\nSQL query:\n{sql}\n\nSQL result:\n{result}"),
+        ])
+
+        ans_response = (answer_prompt | llm).invoke({
+            "query": state["query"],
+            "sql": sql_query,
+            "result": sql_result,
+        })
+
+        answer = _safe_text(ans_response.content)
+        print("[nl2sql] Answer generated successfully")
+
+    return {
+        **state,
+        "sql_query_executed": sql_query,
+        "sql_result": sql_result,
+        "answer": answer,
+        "database_name": _SQL_DB_NAME,
+        "sql_success": has_data,
+    }
+
+# Check SQL Result Edge
+def check_sql_result(state: GraphState) -> str:
+    result = state.get("sql_result", "")
+    has_data = _looks_like_has_data(result)
+
+    if has_data:
+        return "end"
+
+    if state["iteration"] < state["max_iterations"]:
+        return "rephrase"
+
+    return "no_answer"
+
+# Rephrase Query Node
+def rephrase_query(state: GraphState) -> GraphState:
+    query = state["query"]
+    failed_query = _current_query(state)
+    route = state.get("route", "document")
+    iteration = state["iteration"]
+
+    _REPHRASE_PROMPT = """\
+        You are an expert query reformulation assistant.
+
+        The previous attempt did not succeed.
+        Your task is to rewrite the query so the next attempt has a better chance of success.
+
+        Return ONLY the rewritten query text.
+        Do not add explanation, bullets, quotes, or labels.
+
+        Rewriting strategy:
+        1. Do not repeat the failed query wording exactly.
+        2. Preserve the user's original meaning.
+        3. Make the next retrieval attempt easier and clearer.
+        4. If route is "document":
+        - emphasize product names, policy terms, headings, synonyms, fee-sheet wording, and likely knowledge-base phrasing
+        5. If route is "sql":
+        - make the request explicit in terms of records, counts, filters, dates, departments, employees, etc.
+        6. Keep it concise but more effective than the failed query.
+
+        Original query:
+        {query}
+
+        Last failed query:
+        {failed_query}
+
+        Route:
+        {route}
+
+        Attempt number:
+        {iteration}
+
+        Rewritten query:
+    """
+
+    llm = get_llm()
+    response = llm.invoke([
+        HumanMessage(content=_REPHRASE_PROMPT.format(
+            query=query,
+            failed_query=failed_query,
+            route=route,
+            iteration=iteration,
+        ))
+    ])
+
+    rephrased = _safe_text(response.content)
+
+    if not rephrased:
+        rephrased = query
+
+    print(f"[rephrase] iteration={iteration} -> '{rephrased}'")
+
+    return {
+        **state,
+        "rephrased_query": rephrased,
+        "iteration": iteration + 1,
+    }
+
+def route_after_rephrase(state: GraphState) -> str:
+    return state["route"]
+
+
+# No Answer Node
+def no_answer_node(state: GraphState) -> GraphState:
+    route = state.get("route", "")
+    search_type = state.get("search_type", "")
+    sql_query = state.get("sql_query_executed", "N/A")
+
+    return {
+        **state,
+        "answer": (
+            f"I could not find a reliable answer after {state['iteration']} attempt(s). "
+            f"Please try rephrasing your question more specifically."
+        ),
+        "policy_citations": "",
+        "sql_query_executed": sql_query if route == "sql" else "N/A",
+        "search_type": search_type,
+        "answer_found": False,
+    }
