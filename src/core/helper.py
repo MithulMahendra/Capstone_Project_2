@@ -105,3 +105,132 @@ def _looks_like_has_data(sql_result: str) -> bool:
         return False
 
     return len(text) > 2
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Extract and parse JSON object from model output.
+    More robust against markdown fences, extra prose, and partial wrappers.
+    """
+    if not text:
+        return None
+
+    text = text.strip()
+
+    # Try direct parse
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    # Remove markdown fences
+    cleaned = re.sub(r"^```(?:json)?", "", text.strip(), flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"```$", "", cleaned).strip()
+
+    try:
+        obj = json.loads(cleaned)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    # Extract first { ... } block
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = cleaned[start:end + 1]
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+    # Regex fallback
+    answer_found_match = re.search(
+        r'"answer_found"\s*:\s*(true|false)',
+        cleaned,
+        flags=re.IGNORECASE
+    )
+    answer_match = re.search(
+        r'"answer"\s*:\s*"([^"]*)"',
+        cleaned,
+        flags=re.DOTALL
+    )
+
+    if answer_found_match or answer_match:
+        return {
+            "answer_found": (
+                answer_found_match.group(1).lower() == "true"
+                if answer_found_match else False
+            ),
+            "answer": answer_match.group(1).strip() if answer_match else "",
+        }
+
+    return None
+
+
+def _chunk_to_searchable_text(chunk: Dict[str, Any]) -> str:
+    """
+    Build a richer text representation of a chunk for reranking/summarization.
+    Especially useful for table chunks and structured data.
+    """
+    metadata = chunk.get("metadata", {}) or {}
+    headings = metadata.get("headings", []) or []
+    captions = metadata.get("captions", []) or []
+
+    parts: List[str] = []
+
+    document_name = str(chunk.get("document_name", "")).strip()
+    if document_name:
+        parts.append(f"Document: {document_name}")
+
+    chunk_type = str(chunk.get("chunk_type", "")).strip()
+    if chunk_type:
+        parts.append(f"Chunk Type: {chunk_type}")
+
+    source_page = chunk.get("source_page")
+    if source_page not in (None, "", "N/A"):
+        parts.append(f"Source Page: {source_page}")
+
+    if headings:
+        heading_text = " > ".join(str(h).strip() for h in headings if str(h).strip())
+        if heading_text:
+            parts.append(f"Headings: {heading_text}")
+
+    if captions:
+        caption_text = " | ".join(str(c).strip() for c in captions if str(c).strip())
+        if caption_text:
+            parts.append(f"Captions: {caption_text}")
+
+    content = str(chunk.get("content", "")).strip()
+    if content:
+        parts.append("Content:")
+        parts.append(content)
+
+    # Common structured/table fields if your ingestion pipeline stores them
+    possible_table_fields = [
+        "table_text",
+        "table_markdown",
+        "table_rows",
+        "rows",
+        "cells",
+        "structured_content",
+    ]
+
+    for key in possible_table_fields:
+        value = chunk.get(key)
+        if value:
+            parts.append(f"{key}:")
+            if isinstance(value, str):
+                parts.append(value)
+            else:
+                try:
+                    parts.append(json.dumps(value, ensure_ascii=False))
+                except Exception:
+                    parts.append(str(value))
+
+    return "\n".join(parts).strip()
+
