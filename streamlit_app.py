@@ -1,7 +1,8 @@
 import streamlit as st
 import requests
 from src.api.v1.schemas.query_schema import DocumentQueryResponse, SQLQueryResponse
-import time 
+import time
+
 # Page config
 st.set_page_config(
     page_title="Document Q&A",
@@ -139,7 +140,7 @@ def render_document_response(response: DocumentQueryResponse):
     def stream_data():
         for word in response.answer.split(" "):
             yield word + " "
-            time.sleep(0.02) # Adjust speed as needed
+            time.sleep(0.02)  # Adjust speed as needed
 
     st.write_stream(stream_data)
 

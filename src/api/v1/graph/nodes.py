@@ -107,7 +107,7 @@ def intent_router_node(state: GraphState) -> GraphState:
         Q: Explain maternity leave policy -> document
         Q: What does payslip deduction mean? -> document
         Q: What is the annual fee for NorthStar Platinum card? -> document
-
+        
         User query:
         {query}
     """
