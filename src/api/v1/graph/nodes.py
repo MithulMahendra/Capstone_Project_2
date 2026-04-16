@@ -63,3 +63,403 @@ def hybrid_search(query: str, k: int = 10) -> List[Dict[str, Any]]:
 _TOOLS = [vector_search, fts_search, hybrid_search]
 _TOOL_MAP = {t.name: t for t in _TOOLS}
 
+# Intent route
+def intent_router_node(state: GraphState) -> GraphState:
+    query = state["query"]
+
+    _INTENT_PROMPT = """\
+        You are a query intent classifier for an enterprise assistant.
+
+        Classify the user query into exactly one category:
+        - sql
+        - document
+
+        Choose sql ONLY if the user is clearly asking for structured database output such as:
+        - records
+        - lists
+        - counts
+        - totals
+        - averages
+        - comparisons
+        - metrics
+        - rows filtered by date, department, employee, etc.
+
+        Choose document for:
+        - policies
+        - FAQs
+        - rules
+        - definitions
+        - explanations
+        - conceptual questions
+        - product information from documents/brochures/manuals
+        - benefits / leave / claims guidance
+        - ambiguous or mixed queries
+        - any question that does not clearly require database rows or calculations
+
+        Important rules:
+        1. If unsure, choose document.
+        2. Product/card/brochure/manual/fee-sheet style questions are document unless the user explicitly asks for database output.
+        3. Reply with exactly one word: sql OR document
+
+        Examples:
+        Q: How many employees joined last month? -> sql
+        Q: Show salary of employee 1042 -> sql
+        Q: Explain maternity leave policy -> document
+        Q: What does payslip deduction mean? -> document
+        Q: What is the annual fee for NorthStar Platinum card? -> document
+
+        User query:
+        {query}
+    """
+
+    llm = get_llm()
+    response = llm.invoke([
+        HumanMessage(content=_INTENT_PROMPT.format(query=query))
+    ])
+
+    route = _safe_text(response.content).lower()
+    if route not in {"sql", "document"}:
+        route = "document"
+
+    print(f"[intent_router] route='{route}'")
+
+    return {
+        **state,
+        "route": route,
+    }
+
+
+def route_after_router(state: GraphState) -> str:
+    return state["route"]
+
+# Agent Retrieve Node
+def agent_retrieve(state: GraphState) -> GraphState:
+    query = _current_query(state)
+
+    _AGENT_SYSTEM_PROMPT = """\
+        You are a retrieval-routing agent for a document knowledge base.
+
+        Your job is ONLY to choose the best retrieval tool and call exactly ONE tool.
+
+        Available tools:
+        1. fts_search
+        - best for exact terms, product names, policy codes, IDs, abbreviations, names, short literal phrases
+        2. vector_search
+        - best for conceptual, explanatory, natural-language questions
+        3. hybrid_search
+        - best for short queries, product queries, ambiguous phrasing, or mixed lexical + semantic intent
+
+        Rules:
+        1. You must call exactly one tool.
+        2. Do NOT answer the question.
+        3. Do NOT add conversational text.
+        4. Prefer:
+        - fts_search for exact codes / IDs / proper nouns / exact product names
+        - vector_search for explanatory questions
+        - hybrid_search for short, product-centric, fee/table, or ambiguous queries
+        5. If uncertain, choose hybrid_search.
+        """
+
+    llm = get_llm()
+    llm_with_tools = llm.bind_tools(_TOOLS, tool_choice="any")
+
+    response = llm_with_tools.invoke([
+        SystemMessage(content=_AGENT_SYSTEM_PROMPT),
+        HumanMessage(content=query),
+    ])
+
+    if not getattr(response, "tool_calls", None):
+        print("[agent_retrieve] No tool call -> fallback hybrid_search")
+        chunks = _hybrid_search(query=query, k=10)
+        return {
+            **state,
+            "raw_chunks": chunks,
+            "search_type": "hybrid_fallback_no_tool_call",
+        }
+
+    tool_call = response.tool_calls[0]
+    tool_name = tool_call["name"]
+    tool_args = tool_call.get("args", {}) or {}
+
+    if "query" not in tool_args or not str(tool_args["query"]).strip():
+        tool_args["query"] = query
+    if "k" not in tool_args:
+        tool_args["k"] = 10
+
+    print(f"[agent_retrieve] selected_tool='{tool_name}' args={tool_args}")
+
+    selected_tool = _TOOL_MAP.get(tool_name)
+    if selected_tool is None:
+        print(f"[agent_retrieve] Unknown tool '{tool_name}' -> fallback hybrid_search")
+        chunks = _hybrid_search(query=query, k=10)
+        return {
+            **state,
+            "raw_chunks": chunks,
+            "search_type": "hybrid_fallback_unknown_tool",
+        }
+
+    try:
+        chunks = selected_tool.invoke(tool_args)
+    except Exception as exc:
+        print(f"[agent_retrieve] Tool error: {exc} -> fallback hybrid_search")
+        chunks = _hybrid_search(query=query, k=10)
+        return {
+            **state,
+            "raw_chunks": chunks,
+            "search_type": "hybrid_fallback_tool_error",
+        }
+
+    if not chunks and tool_name != "hybrid_search":
+        print("[agent_retrieve] Empty retrieval -> fallback hybrid_search")
+        chunks = _hybrid_search(query=query, k=10)
+        return {
+            **state,
+            "raw_chunks": chunks,
+            "search_type": "hybrid_fallback_empty",
+        }
+
+    print(f"[agent_retrieve] retrieved={len(chunks)} chunks")
+    return {
+        **state,
+        "raw_chunks": chunks,
+        "search_type": tool_name,
+    }
+
+# Rerank Node
+def rerank(state: GraphState) -> GraphState:
+    query = _current_query(state)
+    chunks = state.get("raw_chunks", []) or []
+
+    if not chunks:
+        print("[rerank] No raw chunks available")
+        return {
+            **state,
+            "reranked_chunks": [],
+            "retrieval_status": "no_chunks",
+        }
+
+    documents = [_chunk_to_searchable_text(c) for c in chunks]
+
+    try:
+        co = cohere.Client(_COHERE_API_KEY)
+        results = co.rerank(
+            query=query,
+            documents=documents,
+            top_n=min(8, len(documents)),
+            model=_RERANK_MODEL,
+        )
+
+        reranked = [
+            {
+                **chunks[r.index],
+                "relevance_score": round(float(r.relevance_score), 4),
+            }
+            for r in results.results
+        ]
+    except Exception as exc:
+        print(f"[rerank] Cohere rerank failed: {exc}")
+        reranked = [{**c, "relevance_score": 0.0} for c in chunks[:8]]
+
+    print(f"[rerank] reranked_count={len(reranked)}")
+
+    for idx, c in enumerate(reranked[:5], start=1):
+        print(
+            f"[rerank] top{idx} chunk_type={c.get('chunk_type')} "
+            f"doc={c.get('document_name')} "
+            f"score={c.get('relevance_score')}"
+        )
+
+    return {
+        **state,
+        "reranked_chunks": reranked,
+        "retrieval_status": "ok" if reranked else "no_chunks",
+    }
+
+
+# Check Relevance 
+def check_relevance(state: GraphState) -> str:
+    """
+    No threshold-based rejection anymore.
+    If any reranked chunks exist -> summarize.
+    If no chunks -> retry until max iterations, else no_answer.
+    """
+    chunks = state.get("reranked_chunks", []) or []
+    iteration = state["iteration"]
+    max_iter = state["max_iterations"]
+
+    if chunks:
+        return "summarize"
+
+    if iteration < max_iter:
+        return "rephrase"
+
+    return "no_answer"
+
+# Summarize Answer Node
+def summarize_answer(state: GraphState) -> GraphState:
+    query = state["query"]
+    chunks = state.get("reranked_chunks", []) or []
+
+    if not chunks:
+        print("[summarize] No reranked chunks available")
+        return {
+            **state,
+            "answer_found": False,
+            "answer": "The provided documents do not contain enough information to answer this question.",
+            "policy_citations": "",
+        }
+
+    context_blocks: List[str] = []
+    for i, c in enumerate(chunks[:8], start=1):
+        block = f"[Chunk {i}]\n{_chunk_to_searchable_text(c)}"
+        context_blocks.append(block)
+
+    context = "\n\n---\n\n".join(context_blocks)
+
+    structured_prompt = """\
+        You are a grounded enterprise document assistant.
+
+        Answer the user's question using ONLY the provided context.
+
+        Rules:
+        1. Use only the provided context.
+        2. Answers may appear in normal text OR inside tables.
+        3. If the answer is in a table, identify the correct row/entity and extract the exact value.
+        4. For product/card questions, match the exact product name exactly if present.
+        5. If the context contains the answer in a table, DO NOT say information is missing.
+        6. If the context truly does not contain enough information:
+        - answer_found = false
+        - answer = "The provided documents do not contain enough information to answer this question."
+        7. Do not hallucinate.
+        8. Do not mention document names, file names, page numbers, chunk numbers, or source references in the answer.
+        9. Be concise, exact, and professional.
+        10. If a numeric fee/price/value is present, return the exact value as stated.
+
+        User question:
+        {query}
+
+        Context:
+        {context}
+        """
+
+    llm = get_llm()
+
+    answer_found = False
+    final_answer = "The provided documents do not contain enough information to answer this question."
+
+    try:
+        structured_llm = llm.with_structured_output(SummaryResult)
+        result = structured_llm.invoke(
+            structured_prompt.format(query=query, context=context)
+        )
+
+        print(f"[summarize] structured_result={result}")
+
+        if isinstance(result, SummaryResult):
+            answer_found = bool(result.answer_found)
+            final_answer = result.answer.strip() or final_answer
+        elif isinstance(result, dict):
+            answer_found = bool(result.get("answer_found", False))
+            final_answer = str(result.get("answer", "")).strip() or final_answer
+        else:
+            print("[summarize] Unexpected structured result type, falling back...")
+            raise ValueError("Unexpected structured output type")
+
+    except Exception as exc:
+        print(f"[summarize] Structured output failed: {exc}")
+
+        fallback_prompt = """\
+            You are a grounded enterprise document assistant.
+
+            Answer the user's question using ONLY the provided context.
+
+            Return valid JSON with exactly this schema:
+            {
+            "answer_found": true,
+            "answer": "string"
+            }
+
+            Rules:
+            1. Use only the provided context.
+            2. Answers may appear in normal text OR inside tables.
+            3. If the answer is in a table, identify the correct row/entity and extract the exact value.
+            4. For product/card questions, match the exact product name if present.
+            5. If the context contains the answer in a table, DO NOT say information is missing.
+            6. If the context truly does not contain enough information, return:
+            {
+            "answer_found": false,
+            "answer": "The provided documents do not contain enough information to answer this question."
+            }
+            7. Do not hallucinate.
+            8. Do not mention document names, file names, page numbers, chunk numbers, or source references in the answer.
+            9. Be concise, exact, and professional.
+            10. If a numeric fee/price/value is present, return the exact value as stated.
+            11. Return ONLY JSON.
+
+            User question:
+            {query}
+
+            Context:
+            {context}
+        """
+
+        response = llm.invoke([
+            HumanMessage(content=fallback_prompt.format(query=query, context=context))
+        ])
+
+        raw_text = _safe_text(response.content)
+        print(f"[summarize] raw_output_repr={raw_text!r}")
+
+        parsed = _extract_json_object(raw_text)
+        print(f"[summarize] parsed={parsed}")
+
+        if parsed:
+            raw_answer_found = parsed.get("answer_found", False)
+            if isinstance(raw_answer_found, str):
+                answer_found = raw_answer_found.strip().lower() == "true"
+            else:
+                answer_found = bool(raw_answer_found)
+
+            final_answer = str(parsed.get("answer", "")).strip() or final_answer
+        else:
+            # Very last fallback heuristic
+            if '"answer_found": true' in raw_text.lower():
+                answer_found = True
+
+                answer_match = re.search(
+                    r'"answer"\s*:\s*"([^"]+)"',
+                    raw_text,
+                    re.DOTALL
+                )
+                if answer_match:
+                    final_answer = answer_match.group(1).strip()
+
+    print(f"[summarize] final answer_found={answer_found}, answer={final_answer!r}")
+
+    seen: List[str] = []
+    for c in chunks:
+        document_name = str(c.get("document_name", "")).strip()
+        if document_name and document_name not in seen:
+            seen.append(document_name)
+
+    return {
+        **state,
+        "answer_found": answer_found,
+        "answer": final_answer,
+        "policy_citations": ", ".join(seen),
+    }
+
+def route_after_summary(state: GraphState) -> str:
+    print(
+        f"[route_after_summary] answer_found={state.get('answer_found')} "
+        f"iteration={state.get('iteration')} "
+        f"answer={state.get('answer')!r}"
+    )
+
+    if state.get("answer_found", False):
+        return "end"
+
+    if state["iteration"] < state["max_iterations"]:
+        return "rephrase"
+
+    return "no_answer"
