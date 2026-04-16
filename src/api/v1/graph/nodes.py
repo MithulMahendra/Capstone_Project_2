@@ -564,3 +564,16 @@ def nl2sql_node(state: GraphState) -> GraphState:
         "database_name": _SQL_DB_NAME,
         "sql_success": has_data,
     }
+
+# Check SQL Result Edge
+def check_sql_result(state: GraphState) -> str:
+    result = state.get("sql_result", "")
+    has_data = _looks_like_has_data(result)
+
+    if has_data:
+        return "end"
+
+    if state["iteration"] < state["max_iterations"]:
+        return "rephrase"
+
+    return "no_answer"
