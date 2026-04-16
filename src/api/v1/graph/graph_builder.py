@@ -82,3 +82,7 @@ def build_graph():
 
 compiled_graph = build_graph()
 graph_image = compiled_graph.get_graph().draw_mermaid_png()
+
+
+with open(r"src\api\v1\graph\graph_builder.png", "wb") as f:
+    f.write(graph_image)
