@@ -131,3 +131,96 @@ def intent_router_node(state: GraphState) -> GraphState:
 
 def route_after_router(state: GraphState) -> str:
     return state["route"]
+
+# Agent Retrieve Node
+def agent_retrieve(state: GraphState) -> GraphState:
+    query = _current_query(state)
+
+    _AGENT_SYSTEM_PROMPT = """\
+        You are a retrieval-routing agent for a document knowledge base.
+
+        Your job is ONLY to choose the best retrieval tool and call exactly ONE tool.
+
+        Available tools:
+        1. fts_search
+        - best for exact terms, product names, policy codes, IDs, abbreviations, names, short literal phrases
+        2. vector_search
+        - best for conceptual, explanatory, natural-language questions
+        3. hybrid_search
+        - best for short queries, product queries, ambiguous phrasing, or mixed lexical + semantic intent
+
+        Rules:
+        1. You must call exactly one tool.
+        2. Do NOT answer the question.
+        3. Do NOT add conversational text.
+        4. Prefer:
+        - fts_search for exact codes / IDs / proper nouns / exact product names
+        - vector_search for explanatory questions
+        - hybrid_search for short, product-centric, fee/table, or ambiguous queries
+        5. If uncertain, choose hybrid_search.
+        """
+
+    llm = get_llm()
+    llm_with_tools = llm.bind_tools(_TOOLS, tool_choice="any")
+
+    response = llm_with_tools.invoke([
+        SystemMessage(content=_AGENT_SYSTEM_PROMPT),
+        HumanMessage(content=query),
+    ])
+
+    if not getattr(response, "tool_calls", None):
+        print("[agent_retrieve] No tool call -> fallback hybrid_search")
+        chunks = _hybrid_search(query=query, k=10)
+        return {
+            **state,
+            "raw_chunks": chunks,
+            "search_type": "hybrid_fallback_no_tool_call",
+        }
+
+    tool_call = response.tool_calls[0]
+    tool_name = tool_call["name"]
+    tool_args = tool_call.get("args", {}) or {}
+
+    if "query" not in tool_args or not str(tool_args["query"]).strip():
+        tool_args["query"] = query
+    if "k" not in tool_args:
+        tool_args["k"] = 10
+
+    print(f"[agent_retrieve] selected_tool='{tool_name}' args={tool_args}")
+
+    selected_tool = _TOOL_MAP.get(tool_name)
+    if selected_tool is None:
+        print(f"[agent_retrieve] Unknown tool '{tool_name}' -> fallback hybrid_search")
+        chunks = _hybrid_search(query=query, k=10)
+        return {
+            **state,
+            "raw_chunks": chunks,
+            "search_type": "hybrid_fallback_unknown_tool",
+        }
+
+    try:
+        chunks = selected_tool.invoke(tool_args)
+    except Exception as exc:
+        print(f"[agent_retrieve] Tool error: {exc} -> fallback hybrid_search")
+        chunks = _hybrid_search(query=query, k=10)
+        return {
+            **state,
+            "raw_chunks": chunks,
+            "search_type": "hybrid_fallback_tool_error",
+        }
+
+    if not chunks and tool_name != "hybrid_search":
+        print("[agent_retrieve] Empty retrieval -> fallback hybrid_search")
+        chunks = _hybrid_search(query=query, k=10)
+        return {
+            **state,
+            "raw_chunks": chunks,
+            "search_type": "hybrid_fallback_empty",
+        }
+
+    print(f"[agent_retrieve] retrieved={len(chunks)} chunks")
+    return {
+        **state,
+        "raw_chunks": chunks,
+        "search_type": tool_name,
+    }
