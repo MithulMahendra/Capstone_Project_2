@@ -63,3 +63,71 @@ def hybrid_search(query: str, k: int = 10) -> List[Dict[str, Any]]:
 _TOOLS = [vector_search, fts_search, hybrid_search]
 _TOOL_MAP = {t.name: t for t in _TOOLS}
 
+# Intent route
+def intent_router_node(state: GraphState) -> GraphState:
+    query = state["query"]
+
+    _INTENT_PROMPT = """\
+        You are a query intent classifier for an enterprise assistant.
+
+        Classify the user query into exactly one category:
+        - sql
+        - document
+
+        Choose sql ONLY if the user is clearly asking for structured database output such as:
+        - records
+        - lists
+        - counts
+        - totals
+        - averages
+        - comparisons
+        - metrics
+        - rows filtered by date, department, employee, etc.
+
+        Choose document for:
+        - policies
+        - FAQs
+        - rules
+        - definitions
+        - explanations
+        - conceptual questions
+        - product information from documents/brochures/manuals
+        - benefits / leave / claims guidance
+        - ambiguous or mixed queries
+        - any question that does not clearly require database rows or calculations
+
+        Important rules:
+        1. If unsure, choose document.
+        2. Product/card/brochure/manual/fee-sheet style questions are document unless the user explicitly asks for database output.
+        3. Reply with exactly one word: sql OR document
+
+        Examples:
+        Q: How many employees joined last month? -> sql
+        Q: Show salary of employee 1042 -> sql
+        Q: Explain maternity leave policy -> document
+        Q: What does payslip deduction mean? -> document
+        Q: What is the annual fee for NorthStar Platinum card? -> document
+
+        User query:
+        {query}
+    """
+
+    llm = get_llm()
+    response = llm.invoke([
+        HumanMessage(content=_INTENT_PROMPT.format(query=query))
+    ])
+
+    route = _safe_text(response.content).lower()
+    if route not in {"sql", "document"}:
+        route = "document"
+
+    print(f"[intent_router] route='{route}'")
+
+    return {
+        **state,
+        "route": route,
+    }
+
+
+def route_after_router(state: GraphState) -> str:
+    return state["route"]
