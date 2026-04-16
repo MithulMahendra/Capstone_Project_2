@@ -577,3 +577,67 @@ def check_sql_result(state: GraphState) -> str:
         return "rephrase"
 
     return "no_answer"
+
+# Rephrase Query Node
+def rephrase_query(state: GraphState) -> GraphState:
+    query = state["query"]
+    failed_query = _current_query(state)
+    route = state.get("route", "document")
+    iteration = state["iteration"]
+
+    _REPHRASE_PROMPT = """\
+        You are an expert query reformulation assistant.
+
+        The previous attempt did not succeed.
+        Your task is to rewrite the query so the next attempt has a better chance of success.
+
+        Return ONLY the rewritten query text.
+        Do not add explanation, bullets, quotes, or labels.
+
+        Rewriting strategy:
+        1. Do not repeat the failed query wording exactly.
+        2. Preserve the user's original meaning.
+        3. Make the next retrieval attempt easier and clearer.
+        4. If route is "document":
+        - emphasize product names, policy terms, headings, synonyms, fee-sheet wording, and likely knowledge-base phrasing
+        5. If route is "sql":
+        - make the request explicit in terms of records, counts, filters, dates, departments, employees, etc.
+        6. Keep it concise but more effective than the failed query.
+
+        Original query:
+        {query}
+
+        Last failed query:
+        {failed_query}
+
+        Route:
+        {route}
+
+        Attempt number:
+        {iteration}
+
+        Rewritten query:
+    """
+
+    llm = get_llm()
+    response = llm.invoke([
+        HumanMessage(content=_REPHRASE_PROMPT.format(
+            query=query,
+            failed_query=failed_query,
+            route=route,
+            iteration=iteration,
+        ))
+    ])
+
+    rephrased = _safe_text(response.content)
+
+    if not rephrased:
+        rephrased = query
+
+    print(f"[rephrase] iteration={iteration} -> '{rephrased}'")
+
+    return {
+        **state,
+        "rephrased_query": rephrased,
+        "iteration": iteration + 1,
+    }
