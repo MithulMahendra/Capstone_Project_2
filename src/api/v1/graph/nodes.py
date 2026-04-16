@@ -294,3 +294,157 @@ def check_relevance(state: GraphState) -> str:
         return "rephrase"
 
     return "no_answer"
+
+# Summarize Answer Node
+def summarize_answer(state: GraphState) -> GraphState:
+    query = state["query"]
+    chunks = state.get("reranked_chunks", []) or []
+
+    if not chunks:
+        print("[summarize] No reranked chunks available")
+        return {
+            **state,
+            "answer_found": False,
+            "answer": "The provided documents do not contain enough information to answer this question.",
+            "policy_citations": "",
+        }
+
+    context_blocks: List[str] = []
+    for i, c in enumerate(chunks[:8], start=1):
+        block = f"[Chunk {i}]\n{_chunk_to_searchable_text(c)}"
+        context_blocks.append(block)
+
+    context = "\n\n---\n\n".join(context_blocks)
+
+    structured_prompt = """\
+        You are a grounded enterprise document assistant.
+
+        Answer the user's question using ONLY the provided context.
+
+        Rules:
+        1. Use only the provided context.
+        2. Answers may appear in normal text OR inside tables.
+        3. If the answer is in a table, identify the correct row/entity and extract the exact value.
+        4. For product/card questions, match the exact product name exactly if present.
+        5. If the context contains the answer in a table, DO NOT say information is missing.
+        6. If the context truly does not contain enough information:
+        - answer_found = false
+        - answer = "The provided documents do not contain enough information to answer this question."
+        7. Do not hallucinate.
+        8. Do not mention document names, file names, page numbers, chunk numbers, or source references in the answer.
+        9. Be concise, exact, and professional.
+        10. If a numeric fee/price/value is present, return the exact value as stated.
+
+        User question:
+        {query}
+
+        Context:
+        {context}
+        """
+
+    llm = get_llm()
+
+    answer_found = False
+    final_answer = "The provided documents do not contain enough information to answer this question."
+
+    try:
+        structured_llm = llm.with_structured_output(SummaryResult)
+        result = structured_llm.invoke(
+            structured_prompt.format(query=query, context=context)
+        )
+
+        print(f"[summarize] structured_result={result}")
+
+        if isinstance(result, SummaryResult):
+            answer_found = bool(result.answer_found)
+            final_answer = result.answer.strip() or final_answer
+        elif isinstance(result, dict):
+            answer_found = bool(result.get("answer_found", False))
+            final_answer = str(result.get("answer", "")).strip() or final_answer
+        else:
+            print("[summarize] Unexpected structured result type, falling back...")
+            raise ValueError("Unexpected structured output type")
+
+    except Exception as exc:
+        print(f"[summarize] Structured output failed: {exc}")
+
+        fallback_prompt = """\
+            You are a grounded enterprise document assistant.
+
+            Answer the user's question using ONLY the provided context.
+
+            Return valid JSON with exactly this schema:
+            {
+            "answer_found": true,
+            "answer": "string"
+            }
+
+            Rules:
+            1. Use only the provided context.
+            2. Answers may appear in normal text OR inside tables.
+            3. If the answer is in a table, identify the correct row/entity and extract the exact value.
+            4. For product/card questions, match the exact product name if present.
+            5. If the context contains the answer in a table, DO NOT say information is missing.
+            6. If the context truly does not contain enough information, return:
+            {
+            "answer_found": false,
+            "answer": "The provided documents do not contain enough information to answer this question."
+            }
+            7. Do not hallucinate.
+            8. Do not mention document names, file names, page numbers, chunk numbers, or source references in the answer.
+            9. Be concise, exact, and professional.
+            10. If a numeric fee/price/value is present, return the exact value as stated.
+            11. Return ONLY JSON.
+
+            User question:
+            {query}
+
+            Context:
+            {context}
+        """
+
+        response = llm.invoke([
+            HumanMessage(content=fallback_prompt.format(query=query, context=context))
+        ])
+
+        raw_text = _safe_text(response.content)
+        print(f"[summarize] raw_output_repr={raw_text!r}")
+
+        parsed = _extract_json_object(raw_text)
+        print(f"[summarize] parsed={parsed}")
+
+        if parsed:
+            raw_answer_found = parsed.get("answer_found", False)
+            if isinstance(raw_answer_found, str):
+                answer_found = raw_answer_found.strip().lower() == "true"
+            else:
+                answer_found = bool(raw_answer_found)
+
+            final_answer = str(parsed.get("answer", "")).strip() or final_answer
+        else:
+            # Very last fallback heuristic
+            if '"answer_found": true' in raw_text.lower():
+                answer_found = True
+
+                answer_match = re.search(
+                    r'"answer"\s*:\s*"([^"]+)"',
+                    raw_text,
+                    re.DOTALL
+                )
+                if answer_match:
+                    final_answer = answer_match.group(1).strip()
+
+    print(f"[summarize] final answer_found={answer_found}, answer={final_answer!r}")
+
+    seen: List[str] = []
+    for c in chunks:
+        document_name = str(c.get("document_name", "")).strip()
+        if document_name and document_name not in seen:
+            seen.append(document_name)
+
+    return {
+        **state,
+        "answer_found": answer_found,
+        "answer": final_answer,
+        "policy_citations": ", ".join(seen),
+    }
