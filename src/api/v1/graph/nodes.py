@@ -1,0 +1,665 @@
+import os
+import json
+import re
+from typing import Any, Dict, List, Optional
+import cohere
+from dotenv import load_dotenv
+from langchain.tools import tool
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate
+from src.api.v1.schemas.query_schema import SummaryResult
+from src.core.helper import get_llm, get_sql_database
+from src.api.v1.graph.state import GraphState
+from src.api.v1.tools.vector_search_tool import vector_search as _vector_search
+from src.api.v1.tools.fts_search_tool import fts_search as _fts_search
+from src.api.v1.tools.hybrid_search_tool import hybrid_search as _hybrid_search
+from src.core.helper import (
+    _safe_text,
+    _current_query,
+    _clean_sql,
+    _chunk_to_searchable_text,
+    _is_safe_select_query,
+    _extract_json_object,
+    _looks_like_has_data,
+)
+
+load_dotenv(override=True)
+
+_COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+_RERANK_MODEL = os.getenv("COHERE_RERANK_MODEL", "rerank-english-v3.0")
+_SQL_DB_NAME = os.getenv("SQL_DB_NAME", "agentic_rag_db")
+_MAX_SQL_ROWS = int(os.getenv("MAX_SQL_ROWS", "50"))
+
+@tool
+def vector_search(query: str, k: int = 10) -> List[Dict[str, Any]]:
+    """
+    Semantic vector search against the knowledge base.
+    Best for conceptual, explanatory, natural-language questions.
+    Example: "What is the maternity leave policy?"
+    """
+    return _vector_search(query=query, k=k)
+
+
+@tool
+def fts_search(query: str, k: int = 10) -> List[Dict[str, Any]]:
+    """
+    Full-text keyword search against the knowledge base.
+    Best for exact names, IDs, abbreviations, codes, policy numbers.
+    Example: "POL-2024-HR-007"
+    """
+    return _fts_search(query=query, k=k)
+
+
+@tool
+def hybrid_search(query: str, k: int = 10) -> List[Dict[str, Any]]:
+    """
+    Hybrid search combining semantic + lexical retrieval.
+    Best for short queries, ambiguous intent, or mixed keyword/concept questions.
+    Example: "bonus policy", "salary slip"
+    """
+    return _hybrid_search(query=query, k=k)
+
+
+_TOOLS = [vector_search, fts_search, hybrid_search]
+_TOOL_MAP = {t.name: t for t in _TOOLS}
+
+# Intent route
+def intent_router_node(state: GraphState) -> GraphState:
+    query = state["query"]
+
+    _INTENT_PROMPT = """\
+        You are a query intent classifier for an enterprise assistant.
+
+        Classify the user query into exactly one category:
+        - sql
+        - document
+
+        Choose sql ONLY if the user is clearly asking for structured database output such as:
+        - records
+        - lists
+        - counts
+        - totals
+        - averages
+        - comparisons
+        - metrics
+        - rows filtered by date, department, employee, etc.
+
+        Choose document for:
+        - policies
+        - FAQs
+        - rules
+        - definitions
+        - explanations
+        - conceptual questions
+        - product information from documents/brochures/manuals
+        - benefits / leave / claims guidance
+        - ambiguous or mixed queries
+        - any question that does not clearly require database rows or calculations
+
+        Important rules:
+        1. If unsure, choose document.
+        2. Product/card/brochure/manual/fee-sheet style questions are document unless the user explicitly asks for database output.
+        3. Reply with exactly one word: sql OR document
+
+        Examples:
+        Q: How many employees joined last month? -> sql
+        Q: Show salary of employee 1042 -> sql
+        Q: Explain maternity leave policy -> document
+        Q: What does payslip deduction mean? -> document
+        Q: What is the annual fee for NorthStar Platinum card? -> document
+
+        User query:
+        {query}
+    """
+
+    llm = get_llm()
+    response = llm.invoke([
+        HumanMessage(content=_INTENT_PROMPT.format(query=query))
+    ])
+
+    route = _safe_text(response.content).lower()
+    if route not in {"sql", "document"}:
+        route = "document"
+
+    print(f"[intent_router] route='{route}'")
+
+    return {
+        **state,
+        "route": route,
+    }
+
+
+def route_after_router(state: GraphState) -> str:
+    return state["route"]
+
+# Agent Retrieve Node
+def agent_retrieve(state: GraphState) -> GraphState:
+    query = _current_query(state)
+
+    _AGENT_SYSTEM_PROMPT = """\
+        You are a retrieval-routing agent for a document knowledge base.
+
+        Your job is ONLY to choose the best retrieval tool and call exactly ONE tool.
+
+        Available tools:
+        1. fts_search
+        - best for exact terms, product names, policy codes, IDs, abbreviations, names, short literal phrases
+        2. vector_search
+        - best for conceptual, explanatory, natural-language questions
+        3. hybrid_search
+        - best for short queries, product queries, ambiguous phrasing, or mixed lexical + semantic intent
+
+        Rules:
+        1. You must call exactly one tool.
+        2. Do NOT answer the question.
+        3. Do NOT add conversational text.
+        4. Prefer:
+        - fts_search for exact codes / IDs / proper nouns / exact product names
+        - vector_search for explanatory questions
+        - hybrid_search for short, product-centric, fee/table, or ambiguous queries
+        5. If uncertain, choose hybrid_search.
+        """
+
+    llm = get_llm()
+    llm_with_tools = llm.bind_tools(_TOOLS, tool_choice="any")
+
+    response = llm_with_tools.invoke([
+        SystemMessage(content=_AGENT_SYSTEM_PROMPT),
+        HumanMessage(content=query),
+    ])
+
+    if not getattr(response, "tool_calls", None):
+        print("[agent_retrieve] No tool call -> fallback hybrid_search")
+        chunks = _hybrid_search(query=query, k=10)
+        return {
+            **state,
+            "raw_chunks": chunks,
+            "search_type": "hybrid_fallback_no_tool_call",
+        }
+
+    tool_call = response.tool_calls[0]
+    tool_name = tool_call["name"]
+    tool_args = tool_call.get("args", {}) or {}
+
+    if "query" not in tool_args or not str(tool_args["query"]).strip():
+        tool_args["query"] = query
+    if "k" not in tool_args:
+        tool_args["k"] = 10
+
+    print(f"[agent_retrieve] selected_tool='{tool_name}' args={tool_args}")
+
+    selected_tool = _TOOL_MAP.get(tool_name)
+    if selected_tool is None:
+        print(f"[agent_retrieve] Unknown tool '{tool_name}' -> fallback hybrid_search")
+        chunks = _hybrid_search(query=query, k=10)
+        return {
+            **state,
+            "raw_chunks": chunks,
+            "search_type": "hybrid_fallback_unknown_tool",
+        }
+
+    try:
+        chunks = selected_tool.invoke(tool_args)
+    except Exception as exc:
+        print(f"[agent_retrieve] Tool error: {exc} -> fallback hybrid_search")
+        chunks = _hybrid_search(query=query, k=10)
+        return {
+            **state,
+            "raw_chunks": chunks,
+            "search_type": "hybrid_fallback_tool_error",
+        }
+
+    if not chunks and tool_name != "hybrid_search":
+        print("[agent_retrieve] Empty retrieval -> fallback hybrid_search")
+        chunks = _hybrid_search(query=query, k=10)
+        return {
+            **state,
+            "raw_chunks": chunks,
+            "search_type": "hybrid_fallback_empty",
+        }
+
+    print(f"[agent_retrieve] retrieved={len(chunks)} chunks")
+    return {
+        **state,
+        "raw_chunks": chunks,
+        "search_type": tool_name,
+    }
+
+# Rerank Node
+def rerank(state: GraphState) -> GraphState:
+    query = _current_query(state)
+    chunks = state.get("raw_chunks", []) or []
+
+    if not chunks:
+        print("[rerank] No raw chunks available")
+        return {
+            **state,
+            "reranked_chunks": [],
+            "retrieval_status": "no_chunks",
+        }
+
+    documents = [_chunk_to_searchable_text(c) for c in chunks]
+
+    try:
+        co = cohere.Client(_COHERE_API_KEY)
+        results = co.rerank(
+            query=query,
+            documents=documents,
+            top_n=min(8, len(documents)),
+            model=_RERANK_MODEL,
+        )
+
+        reranked = [
+            {
+                **chunks[r.index],
+                "relevance_score": round(float(r.relevance_score), 4),
+            }
+            for r in results.results
+        ]
+    except Exception as exc:
+        print(f"[rerank] Cohere rerank failed: {exc}")
+        reranked = [{**c, "relevance_score": 0.0} for c in chunks[:8]]
+
+    print(f"[rerank] reranked_count={len(reranked)}")
+
+    for idx, c in enumerate(reranked[:5], start=1):
+        print(
+            f"[rerank] top{idx} chunk_type={c.get('chunk_type')} "
+            f"doc={c.get('document_name')} "
+            f"score={c.get('relevance_score')}"
+        )
+
+    return {
+        **state,
+        "reranked_chunks": reranked,
+        "retrieval_status": "ok" if reranked else "no_chunks",
+    }
+
+
+# Check Relevance 
+def check_relevance(state: GraphState) -> str:
+    """
+    No threshold-based rejection anymore.
+    If any reranked chunks exist -> summarize.
+    If no chunks -> retry until max iterations, else no_answer.
+    """
+    chunks = state.get("reranked_chunks", []) or []
+    iteration = state["iteration"]
+    max_iter = state["max_iterations"]
+
+    if chunks:
+        return "summarize"
+
+    if iteration < max_iter:
+        return "rephrase"
+
+    return "no_answer"
+
+# Summarize Answer Node
+def summarize_answer(state: GraphState) -> GraphState:
+    query = state["query"]
+    chunks = state.get("reranked_chunks", []) or []
+
+    if not chunks:
+        print("[summarize] No reranked chunks available")
+        return {
+            **state,
+            "answer_found": False,
+            "answer": "The provided documents do not contain enough information to answer this question.",
+            "policy_citations": "",
+        }
+
+    context_blocks: List[str] = []
+    for i, c in enumerate(chunks[:8], start=1):
+        block = f"[Chunk {i}]\n{_chunk_to_searchable_text(c)}"
+        context_blocks.append(block)
+
+    context = "\n\n---\n\n".join(context_blocks)
+
+    structured_prompt = """\
+        You are a grounded enterprise document assistant.
+
+        Answer the user's question using ONLY the provided context.
+
+        Rules:
+        1. Use only the provided context.
+        2. Answers may appear in normal text OR inside tables.
+        3. If the answer is in a table, identify the correct row/entity and extract the exact value.
+        4. For product/card questions, match the exact product name exactly if present.
+        5. If the context contains the answer in a table, DO NOT say information is missing.
+        6. If the context truly does not contain enough information:
+        - answer_found = false
+        - answer = "The provided documents do not contain enough information to answer this question."
+        7. Do not hallucinate.
+        8. Do not mention document names, file names, page numbers, chunk numbers, or source references in the answer.
+        9. Be concise, exact, and professional.
+        10. If a numeric fee/price/value is present, return the exact value as stated.
+
+        User question:
+        {query}
+
+        Context:
+        {context}
+        """
+
+    llm = get_llm()
+
+    answer_found = False
+    final_answer = "The provided documents do not contain enough information to answer this question."
+
+    try:
+        structured_llm = llm.with_structured_output(SummaryResult)
+        result = structured_llm.invoke(
+            structured_prompt.format(query=query, context=context)
+        )
+
+        print(f"[summarize] structured_result={result}")
+
+        if isinstance(result, SummaryResult):
+            answer_found = bool(result.answer_found)
+            final_answer = result.answer.strip() or final_answer
+        elif isinstance(result, dict):
+            answer_found = bool(result.get("answer_found", False))
+            final_answer = str(result.get("answer", "")).strip() or final_answer
+        else:
+            print("[summarize] Unexpected structured result type, falling back...")
+            raise ValueError("Unexpected structured output type")
+
+    except Exception as exc:
+        print(f"[summarize] Structured output failed: {exc}")
+
+        fallback_prompt = """\
+            You are a grounded enterprise document assistant.
+
+            Answer the user's question using ONLY the provided context.
+
+            Return valid JSON with exactly this schema:
+            {
+            "answer_found": true,
+            "answer": "string"
+            }
+
+            Rules:
+            1. Use only the provided context.
+            2. Answers may appear in normal text OR inside tables.
+            3. If the answer is in a table, identify the correct row/entity and extract the exact value.
+            4. For product/card questions, match the exact product name if present.
+            5. If the context contains the answer in a table, DO NOT say information is missing.
+            6. If the context truly does not contain enough information, return:
+            {
+            "answer_found": false,
+            "answer": "The provided documents do not contain enough information to answer this question."
+            }
+            7. Do not hallucinate.
+            8. Do not mention document names, file names, page numbers, chunk numbers, or source references in the answer.
+            9. Be concise, exact, and professional.
+            10. If a numeric fee/price/value is present, return the exact value as stated.
+            11. Return ONLY JSON.
+
+            User question:
+            {query}
+
+            Context:
+            {context}
+        """
+
+        response = llm.invoke([
+            HumanMessage(content=fallback_prompt.format(query=query, context=context))
+        ])
+
+        raw_text = _safe_text(response.content)
+        print(f"[summarize] raw_output_repr={raw_text!r}")
+
+        parsed = _extract_json_object(raw_text)
+        print(f"[summarize] parsed={parsed}")
+
+        if parsed:
+            raw_answer_found = parsed.get("answer_found", False)
+            if isinstance(raw_answer_found, str):
+                answer_found = raw_answer_found.strip().lower() == "true"
+            else:
+                answer_found = bool(raw_answer_found)
+
+            final_answer = str(parsed.get("answer", "")).strip() or final_answer
+        else:
+            # Very last fallback heuristic
+            if '"answer_found": true' in raw_text.lower():
+                answer_found = True
+
+                answer_match = re.search(
+                    r'"answer"\s*:\s*"([^"]+)"',
+                    raw_text,
+                    re.DOTALL
+                )
+                if answer_match:
+                    final_answer = answer_match.group(1).strip()
+
+    print(f"[summarize] final answer_found={answer_found}, answer={final_answer!r}")
+
+    seen: List[str] = []
+    for c in chunks:
+        document_name = str(c.get("document_name", "")).strip()
+        if document_name and document_name not in seen:
+            seen.append(document_name)
+
+    return {
+        **state,
+        "answer_found": answer_found,
+        "answer": final_answer,
+        "policy_citations": ", ".join(seen),
+    }
+
+def route_after_summary(state: GraphState) -> str:
+    print(
+        f"[route_after_summary] answer_found={state.get('answer_found')} "
+        f"iteration={state.get('iteration')} "
+        f"answer={state.get('answer')!r}"
+    )
+
+    if state.get("answer_found", False):
+        return "end"
+
+    if state["iteration"] < state["max_iterations"]:
+        return "rephrase"
+
+    return "no_answer"
+
+# NL2SQL Node
+def nl2sql_node(state: GraphState) -> GraphState:
+    query = _current_query(state)
+    llm = get_llm()
+    db = get_sql_database()
+
+    schema_info = db.get_table_info()
+
+    _NL2SQL_SYSTEM = f"""\
+        You are a PostgreSQL expert that converts natural language into one safe SQL query.
+
+        Return ONLY raw SQL. No explanation. No markdown. No backticks.
+
+        Hard rules:
+        1. Generate exactly one read-only SQL query.
+        2. Allowed statements: SELECT or WITH ... SELECT only.
+        3. Never generate INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, MERGE, GRANT, or REVOKE.
+        4. Use only tables and columns that exist in the provided schema.
+        5. For non-aggregate queries, include LIMIT {_MAX_SQL_ROWS}.
+        6. If the user asks for counting, averaging, totals, grouping, or comparisons, use SQL aggregates correctly.
+        7. If text filtering is needed, use ILIKE where appropriate.
+        8. If the query is ambiguous, choose the most reasonable interpretation based only on the schema.
+        9. Do not invent columns or tables.
+        10. Do not output anything except SQL.
+
+        Database schema:
+        {{schema}}
+    """
+
+    sql_prompt = ChatPromptTemplate.from_messages([
+        ("system", _NL2SQL_SYSTEM),
+        ("human", "User question: {question}"),
+    ])
+
+    raw_sql_response = (sql_prompt | llm).invoke({
+        "schema": schema_info,
+        "question": query,
+    })
+
+    sql_query = _clean_sql(_safe_text(raw_sql_response.content))
+    print(f"[nl2sql] Generated SQL:\n{sql_query}")
+
+    if not _is_safe_select_query(sql_query):
+        print("[nl2sql] Unsafe or invalid SQL generated")
+        return {
+            **state,
+            "sql_query_executed": sql_query,
+            "sql_result": "SQL execution error: generated query was unsafe or invalid.",
+            "answer": "",
+            "database_name": _SQL_DB_NAME,
+            "sql_success": False,
+        }
+
+    try:
+        sql_result = db.run(sql_query)
+        sql_result = str(sql_result)
+    except Exception as exc:
+        sql_result = f"SQL execution error: {exc}"
+
+    print(f"[nl2sql] Result (truncated): {sql_result[:300]}")
+
+    has_data = _looks_like_has_data(sql_result)
+
+    answer = ""
+    if has_data:
+        _SQL_ANSWER_SYSTEM = """\
+            You are a concise data analyst.
+
+            Answer the user's question using ONLY the SQL result provided.
+
+            Rules:
+            1. Use only the SQL result.
+            2. Be concise and directly answer the question.
+            3. If the result is tabular, summarize clearly.
+            4. Do not mention assumptions unless necessary.
+            5. Do not mention SQL unless helpful.
+        """
+
+        answer_prompt = ChatPromptTemplate.from_messages([
+            ("system", _SQL_ANSWER_SYSTEM),
+            ("human", "User question:\n{query}\n\nSQL query:\n{sql}\n\nSQL result:\n{result}"),
+        ])
+
+        ans_response = (answer_prompt | llm).invoke({
+            "query": state["query"],
+            "sql": sql_query,
+            "result": sql_result,
+        })
+
+        answer = _safe_text(ans_response.content)
+        print("[nl2sql] Answer generated successfully")
+
+    return {
+        **state,
+        "sql_query_executed": sql_query,
+        "sql_result": sql_result,
+        "answer": answer,
+        "database_name": _SQL_DB_NAME,
+        "sql_success": has_data,
+    }
+
+# Check SQL Result Edge
+def check_sql_result(state: GraphState) -> str:
+    result = state.get("sql_result", "")
+    has_data = _looks_like_has_data(result)
+
+    if has_data:
+        return "end"
+
+    if state["iteration"] < state["max_iterations"]:
+        return "rephrase"
+
+    return "no_answer"
+
+# Rephrase Query Node
+def rephrase_query(state: GraphState) -> GraphState:
+    query = state["query"]
+    failed_query = _current_query(state)
+    route = state.get("route", "document")
+    iteration = state["iteration"]
+
+    _REPHRASE_PROMPT = """\
+        You are an expert query reformulation assistant.
+
+        The previous attempt did not succeed.
+        Your task is to rewrite the query so the next attempt has a better chance of success.
+
+        Return ONLY the rewritten query text.
+        Do not add explanation, bullets, quotes, or labels.
+
+        Rewriting strategy:
+        1. Do not repeat the failed query wording exactly.
+        2. Preserve the user's original meaning.
+        3. Make the next retrieval attempt easier and clearer.
+        4. If route is "document":
+        - emphasize product names, policy terms, headings, synonyms, fee-sheet wording, and likely knowledge-base phrasing
+        5. If route is "sql":
+        - make the request explicit in terms of records, counts, filters, dates, departments, employees, etc.
+        6. Keep it concise but more effective than the failed query.
+
+        Original query:
+        {query}
+
+        Last failed query:
+        {failed_query}
+
+        Route:
+        {route}
+
+        Attempt number:
+        {iteration}
+
+        Rewritten query:
+    """
+
+    llm = get_llm()
+    response = llm.invoke([
+        HumanMessage(content=_REPHRASE_PROMPT.format(
+            query=query,
+            failed_query=failed_query,
+            route=route,
+            iteration=iteration,
+        ))
+    ])
+
+    rephrased = _safe_text(response.content)
+
+    if not rephrased:
+        rephrased = query
+
+    print(f"[rephrase] iteration={iteration} -> '{rephrased}'")
+
+    return {
+        **state,
+        "rephrased_query": rephrased,
+        "iteration": iteration + 1,
+    }
+
+def route_after_rephrase(state: GraphState) -> str:
+    return state["route"]
+
+
+# No Answer Node
+def no_answer_node(state: GraphState) -> GraphState:
+    route = state.get("route", "")
+    search_type = state.get("search_type", "")
+    sql_query = state.get("sql_query_executed", "N/A")
+
+    return {
+        **state,
+        "answer": (
+            f"I could not find a reliable answer after {state['iteration']} attempt(s). "
+            f"Please try rephrasing your question more specifically."
+        ),
+        "policy_citations": "",
+        "sql_query_executed": sql_query if route == "sql" else "N/A",
+        "search_type": search_type,
+        "answer_found": False,
+    }
