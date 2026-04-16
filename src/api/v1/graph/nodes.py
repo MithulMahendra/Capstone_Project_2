@@ -224,3 +224,53 @@ def agent_retrieve(state: GraphState) -> GraphState:
         "raw_chunks": chunks,
         "search_type": tool_name,
     }
+
+# Rerank Node
+def rerank(state: GraphState) -> GraphState:
+    query = _current_query(state)
+    chunks = state.get("raw_chunks", []) or []
+
+    if not chunks:
+        print("[rerank] No raw chunks available")
+        return {
+            **state,
+            "reranked_chunks": [],
+            "retrieval_status": "no_chunks",
+        }
+
+    documents = [_chunk_to_searchable_text(c) for c in chunks]
+
+    try:
+        co = cohere.Client(_COHERE_API_KEY)
+        results = co.rerank(
+            query=query,
+            documents=documents,
+            top_n=min(8, len(documents)),
+            model=_RERANK_MODEL,
+        )
+
+        reranked = [
+            {
+                **chunks[r.index],
+                "relevance_score": round(float(r.relevance_score), 4),
+            }
+            for r in results.results
+        ]
+    except Exception as exc:
+        print(f"[rerank] Cohere rerank failed: {exc}")
+        reranked = [{**c, "relevance_score": 0.0} for c in chunks[:8]]
+
+    print(f"[rerank] reranked_count={len(reranked)}")
+
+    for idx, c in enumerate(reranked[:5], start=1):
+        print(
+            f"[rerank] top{idx} chunk_type={c.get('chunk_type')} "
+            f"doc={c.get('document_name')} "
+            f"score={c.get('relevance_score')}"
+        )
+
+    return {
+        **state,
+        "reranked_chunks": reranked,
+        "retrieval_status": "ok" if reranked else "no_chunks",
+    }
