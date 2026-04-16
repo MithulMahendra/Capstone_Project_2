@@ -22,14 +22,17 @@ def build_graph():
     # Entry point
     graph.set_entry_point("router")
 
+    
     graph.add_conditional_edges(
         "router",
         route_after_router,
         {
             "document": "agent_retrieve",
             "sql": "nl2sql",
+            "out_of_scope": END,
         },
     )
+
 
     # Document route
     graph.add_edge("agent_retrieve", "rerank")
@@ -81,8 +84,8 @@ def build_graph():
 
 
 compiled_graph = build_graph()
-graph_image = compiled_graph.get_graph().draw_mermaid_png()
 
+graph_image = compiled_graph.get_graph().draw_mermaid_png()
 
 with open(r"src\api\v1\graph\graph_builder.png", "wb") as f:
     f.write(graph_image)
