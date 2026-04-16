@@ -641,3 +641,25 @@ def rephrase_query(state: GraphState) -> GraphState:
         "rephrased_query": rephrased,
         "iteration": iteration + 1,
     }
+
+def route_after_rephrase(state: GraphState) -> str:
+    return state["route"]
+
+
+# No Answer Node
+def no_answer_node(state: GraphState) -> GraphState:
+    route = state.get("route", "")
+    search_type = state.get("search_type", "")
+    sql_query = state.get("sql_query_executed", "N/A")
+
+    return {
+        **state,
+        "answer": (
+            f"I could not find a reliable answer after {state['iteration']} attempt(s). "
+            f"Please try rephrasing your question more specifically."
+        ),
+        "policy_citations": "",
+        "sql_query_executed": sql_query if route == "sql" else "N/A",
+        "search_type": search_type,
+        "answer_found": False,
+    }
